@@ -3,7 +3,8 @@ import datetime
 import shutil
 import os
 import subprocess
-from typing import Dict, List, Tuple
+import traceback
+from typing import Dict, List, Tuple, Union
 import logging
 import ffmpeg
 import utils
@@ -19,14 +20,16 @@ def parse_danmu(dir_name):
             for obj in reader:
                 danmu_list.append({
                     "text": obj['text'],
-                    "time": obj['properties']['time']//1000
+                    "time": obj['properties']['time']//1000,
+                    "uid": str(obj['user_info']['user_id'])
                 })
     if os.path.exists(os.path.join(dir_name, 'superchat.jsonl')):
         with jsonlines.open(os.path.join(dir_name, 'superchat.jsonl')) as reader:
             for obj in reader:
                 danmu_list.append({
                     "text": obj['text'],
-                    "time": obj['time']
+                    "time": obj['time'],
+                    "uid": str(obj['user_id'])
                 })
     danmu_list = sorted(danmu_list, key=lambda x: x['time'])
     return danmu_list
@@ -58,6 +61,23 @@ def get_cut_points(time_dict: Dict[datetime.datetime, List[str]], up_ratio: floa
     return cut_points
 
 
+def get_manual_cut_points(danmu_list: List[Dict], uid: str) -> List[Tuple[datetime.datetime, datetime.datetime, List[str]]]:
+    cut_points = []
+    count = 0
+    for danmu_obj in danmu_list:
+        if danmu_obj['uid'] == uid and danmu_obj['text'].startswith("/DDR clip"):
+            count += 1
+            args = danmu_obj['text'].split()
+            duration = int(args[2])
+            end_time = datetime.datetime.fromtimestamp(danmu_obj['time'])
+            start_time = end_time - datetime.timedelta(seconds=duration)
+            hint_text = f"手动切片_{count}"
+            if len(args) >= 4:
+                hint_text = " ".join(args[3:])
+            cut_points.append((start_time, end_time, [hint_text]))
+    return cut_points
+
+
 def get_true_timestamp(video_times: List[Tuple[datetime.datetime, float]], point: datetime.datetime) -> float:
     time_passed = 0
     for t, d in video_times:
@@ -82,16 +102,24 @@ def count(danmu_list: List, live_start: datetime.datetime, live_duration: float,
     return return_dict
 
 
-def flv2ts(input_file: str, output_file: str, ffmpeg_logfile_hander) -> subprocess.CompletedProcess:
-    ret = subprocess.run(
-        f"ffmpeg -y -fflags +discardcorrupt -i {input_file} -c copy -bsf:v h264_mp4toannexb -f mpegts {output_file}", shell=True, check=True, stdout=ffmpeg_logfile_hander)
-    return ret
+def flv2ts(input_file: str, output_file: str, ffmpeg_logfile_hander) -> Union[subprocess.CompletedProcess, subprocess.CalledProcessError]:
+    try:
+        ret = subprocess.run(
+            f"ffmpeg -y -fflags +discardcorrupt -i {input_file} -c copy -bsf:v h264_mp4toannexb -acodec aac -f mpegts {output_file}", shell=True, check=True, stdout=ffmpeg_logfile_hander)
+        return ret
+    except subprocess.CalledProcessError as err:
+        traceback.print_exc()
+        return err
 
 
-def concat(merge_conf_path: str, merged_file_path: str, ffmpeg_logfile_hander) -> subprocess.CompletedProcess:
-    ret = subprocess.run(
-        f"ffmpeg -y -f concat -safe 0 -i {merge_conf_path} -c copy -fflags +igndts -avoid_negative_ts make_zero {merged_file_path}", shell=True, check=True, stdout=ffmpeg_logfile_hander)
-    return ret
+def concat(merge_conf_path: str, merged_file_path: str, ffmpeg_logfile_hander) -> Union[subprocess.CompletedProcess, subprocess.CalledProcessError]:
+    try:
+        ret = subprocess.run(
+            f"ffmpeg -y -f concat -safe 0 -i {merge_conf_path} -c copy -fflags +igndts -avoid_negative_ts make_zero {merged_file_path}", shell=True, check=True, stdout=ffmpeg_logfile_hander)
+        return ret
+    except subprocess.CalledProcessError as err:
+        traceback.print_exc()
+        return err
 
 
 def get_start_time(filename: str) -> datetime.datetime:
@@ -129,7 +157,7 @@ class Processor(BiliLive):
         self.ffmpeg_logfile_hander = open(os.path.join(config.get('root', {}).get('logger', {}).get('log_path', "./log"), "FFMpeg_"+datetime.datetime.now(
         ).strftime('%Y-%m-%d_%H-%M-%S')+'.log'), mode="a", encoding="utf-8")
 
-    def pre_concat(self) -> None:
+    def pre_concat(self) -> Union[subprocess.CompletedProcess, subprocess.CalledProcessError]:
         filelist = os.listdir(self.record_dir)
         with open(self.merge_conf_path, "w", encoding="utf-8") as f:
             ts_path_list = []
@@ -138,9 +166,9 @@ class Processor(BiliLive):
                         os.path.join(self.record_dir, filename))[1] == ".flv" and os.path.getsize(os.path.join(self.record_dir, filename)) > 1024*1024:
                     ts_path = os.path.splitext(os.path.join(
                         self.record_dir, filename))[0]+".ts"
-                    _ = flv2ts(os.path.join(
+                    ret = flv2ts(os.path.join(
                         self.record_dir, filename), ts_path, self.ffmpeg_logfile_hander)
-                    if not self.config.get('spec', {}).get('recorder', {}).get('keep_raw_record', False):
+                    if isinstance(ret, subprocess.CompletedProcess) and not self.config.get('spec', {}).get('recorder', {}).get('keep_raw_record', False):
                         os.remove(os.path.join(self.record_dir, filename))
                     # ts_path = os.path.join(self.record_dir, filename)
                     duration = float(ffmpeg.probe(ts_path)[
@@ -152,22 +180,28 @@ class Processor(BiliLive):
             for full_ts_path in ts_path_list:
                 f.write(
                     f"file '{full_ts_path}'\n")
-        _ = concat(self.merge_conf_path, self.merged_file_path,
-                   self.ffmpeg_logfile_hander)
+        ret = concat(self.merge_conf_path, self.merged_file_path,
+                     self.ffmpeg_logfile_hander)
         self.times.sort(key=lambda x: x[0])
         self.live_start = self.times[0][0]
         self.live_duration = (
             self.times[-1][0]-self.times[0][0]).total_seconds()+self.times[-1][1]
+        return ret
 
-    def __cut_video(self, outhint: List[str], start_time: int, delta: int) -> subprocess.CompletedProcess:
+    def __cut_video(self, outhint: List[str], start_time: int, delta: int) -> Union[subprocess.CompletedProcess, subprocess.CalledProcessError]:
         output_file = os.path.join(
             self.outputs_dir, f"{self.room_id}_{self.global_start.strftime('%Y-%m-%d_%H-%M-%S')}_{start_time:012}_{outhint}.mp4")
         cmd = f'ffmpeg -y -ss {start_time} -t {delta} -accurate_seek -i "{self.merged_file_path}" -c copy -avoid_negative_ts 1 "{output_file}"'
-        ret = subprocess.run(cmd, shell=True, check=True,
-                             stdout=self.ffmpeg_logfile_hander)
-        return ret
+        try:
+            ret = subprocess.run(cmd, shell=True, check=True,
+                                 stdout=self.ffmpeg_logfile_hander)
+            return ret
+        except subprocess.CalledProcessError as err:
+            traceback.print_exc()
+            return err
 
-    def cut(self, cut_points: List[Tuple[datetime.datetime, datetime.datetime, List[str]]], min_length: int = 60) -> None:
+    def cut(self, cut_points: List[Tuple[datetime.datetime, datetime.datetime, List[str]]], min_length: int = 60) -> bool:
+        success = True
         duration = float(ffmpeg.probe(self.merged_file_path)
                          ['format']['duration'])
         for cut_start, cut_end, tags in cut_points:
@@ -178,55 +212,85 @@ class Processor(BiliLive):
             delta = end-start
             outhint = " ".join(tags)
             if delta >= min_length:
-                self.__cut_video(outhint, max(
+                ret = self.__cut_video(outhint, max(
                     0, int(start)), int(delta))
+                success = success and isinstance(
+                    ret, subprocess.CompletedProcess)
+        return success
 
-    def split(self, split_interval: int = 3600) -> None:
+    def split(self, split_interval: int = 3600) -> bool:
+        success = True
         if split_interval <= 0:
             shutil.copy2(self.merged_file_path, os.path.join(
-                self.splits_dir, f"{self.room_id}_{self.global_start.strftime('%Y-%m-%d_%H-%M-%S')}_0.mp4"))
-            return
+                self.splits_dir, f"{self.room_id}_{self.global_start.strftime('%Y-%m-%d_%H-%M-%S')}_0000.mp4"))
+            return success
 
         duration = float(ffmpeg.probe(self.merged_file_path)
                          ['format']['duration'])
         num_splits = int(duration) // split_interval + 1
         for i in range(num_splits):
             output_file = os.path.join(
-                self.splits_dir, f"{self.room_id}_{self.global_start.strftime('%Y-%m-%d_%H-%M-%S')}_{i}.mp4")
+                self.splits_dir, f"{self.room_id}_{self.global_start.strftime('%Y-%m-%d_%H-%M-%S')}_{i:04}.mp4")
             cmd = f'ffmpeg -y -ss {i*split_interval} -t {split_interval} -accurate_seek -i "{self.merged_file_path}" -c copy -avoid_negative_ts 1 "{output_file}"'
-            _ = subprocess.run(cmd, shell=True, check=True,
-                               stdout=self.ffmpeg_logfile_hander)
+            try:
+                _ = subprocess.run(cmd, shell=True, check=True,
+                                   stdout=self.ffmpeg_logfile_hander)
+            except subprocess.CalledProcessError:
+                traceback.print_exc()
+                success = False
+        return success
 
-    def run(self) -> None:
-        self.pre_concat()
-        if not self.config.get('spec', {}).get('recorder', {}).get('keep_raw_record', False):
-            if os.path.exists(self.merged_file_path):
-                utils.del_files_and_dir(self.record_dir)
-        # duration = float(ffmpeg.probe(self.merged_file_path)[
-        #                              'format']['duration'])
-        # start_time = get_start_time(self.merged_file_path)
-        # self.times.append((start_time, duration))
-        # self.live_start = self.times[0][0]
-        # self.live_duration = (
-        #     self.times[-1][0]-self.times[0][0]).total_seconds()+self.times[-1][1]
+    def run(self) -> bool:
+        try:
+            ret = self.pre_concat()
+            success = isinstance(ret, subprocess.CompletedProcess)
+            if success and not self.config.get('spec', {}).get('recorder', {}).get('keep_raw_record', False):
+                if os.path.exists(self.merged_file_path):
+                    utils.del_files_and_dir(self.record_dir)
+            # duration = float(ffmpeg.probe(self.merged_file_path)[
+            #                              'format']['duration'])
+            # start_time = get_start_time(self.merged_file_path)
+            # self.times.append((start_time, duration))
+            # self.live_start = self.times[0][0]
+            # self.live_duration = (
+            #     self.times[-1][0]-self.times[0][0]).total_seconds()+self.times[-1][1]
 
-        if self.config.get('spec', {}).get('clipper', {}).get('enable_clipper', False):
-            danmu_list = parse_danmu(self.danmu_path)
-            counted_danmu_dict = count(
-                danmu_list, self.live_start, self.live_duration, self.config.get('spec', {}).get('parser', {}).get('interval', 60))
-            cut_points = get_cut_points(counted_danmu_dict, self.config.get('spec', {}).get('parser', {}).get('up_ratio', 2.5),
-                                        self.config.get('spec', {}).get('parser', {}).get('down_ratio', 0.75), self.config.get('spec', {}).get('parser', {}).get('topK', 5))
-            self.cut(cut_points, self.config.get('spec', {}).get(
-                'clipper', {}).get('min_length', 60))
-        if self.config.get('spec', {}).get('uploader', {}).get('record', {}).get('upload_record', False):
-            self.split(self.config.get('spec', {}).get('uploader', {})
-                       .get('record', {}).get('split_interval', 3600))
+            if not self.config.get('spec', {}).get('clipper', {}).get('enable_clipper', False) and not self.config.get('spec', {}).get('manual_clipper', {}).get('enabled', False):
+                os.rmdir(self.outputs_dir)
+
+            if not self.config.get('spec', {}).get('uploader', {}).get('record', {}).get('upload_record', False):
+                os.rmdir(self.splits_dir)
+
+            if self.config.get('spec', {}).get('clipper', {}).get('enable_clipper', False):
+                danmu_list = parse_danmu(self.danmu_path)
+                counted_danmu_dict = count(
+                    danmu_list, self.live_start, self.live_duration, self.config.get('spec', {}).get('parser', {}).get('interval', 60))
+                cut_points = get_cut_points(counted_danmu_dict, self.config.get('spec', {}).get('parser', {}).get('up_ratio', 2.5),
+                                            self.config.get('spec', {}).get('parser', {}).get('down_ratio', 0.75), self.config.get('spec', {}).get('parser', {}).get('topK', 5))
+                ret = self.cut(cut_points, self.config.get('spec', {}).get(
+                    'clipper', {}).get('min_length', 60))
+                success = success and ret
+            if self.config.get('spec', {}).get('manual_clipper', {}).get('enabled', False):
+                danmu_list = parse_danmu(self.danmu_path)
+                cut_points = get_manual_cut_points(danmu_list, self.config.get(
+                    'spec', {}).get('manual_clipper', {}).get('uid', ""))
+                ret = self.cut(cut_points, 0)
+                success = success and ret
+            if self.config.get('spec', {}).get('uploader', {}).get('record', {}).get('upload_record', False):
+                ret = self.split(self.config.get('spec', {}).get('uploader', {})
+                                 .get('record', {}).get('split_interval', 3600))
+                success = success and ret
+            return success
+        except:
+            traceback.print_exc()
+            return False
 
 
 if __name__ == "__main__":
     danmu_list = parse_danmu("data/data/danmu/22603245_2021-03-13_11-20-16")
-    counted_danmu_dict = count(
-        danmu_list, datetime.datetime.strptime("2021-03-13_11-20-16", "%Y-%m-%d_%H-%M-%S"), (datetime.datetime.strptime("2021-03-13_13-45-16", "%Y-%m-%d_%H-%M-%S")-datetime.datetime.strptime("2021-03-13_11-20-16", "%Y-%m-%d_%H-%M-%S")).total_seconds(), 30)
-    cut_points = get_cut_points(counted_danmu_dict, 2.5,
-                                0.75, 5)
+    # counted_danmu_dict = count(
+    #     danmu_list, datetime.datetime.strptime("2021-03-13_11-20-16", "%Y-%m-%d_%H-%M-%S"), (datetime.datetime.strptime("2021-03-13_13-45-16", "%Y-%m-%d_%H-%M-%S")-datetime.datetime.strptime("2021-03-13_11-20-16", "%Y-%m-%d_%H-%M-%S")).total_seconds(), 30)
+    # cut_points = get_cut_points(counted_danmu_dict, 2.5,
+    #                             0.75, 5)
+    cut_points = get_manual_cut_points(danmu_list, "8559982")
     print(cut_points)

@@ -44,6 +44,7 @@ def init_data_dirs(root_dir: str = os.getcwd()) -> None:
     check_and_create_dir(os.path.join(root_dir, 'data', 'danmu'))
     check_and_create_dir(os.path.join(root_dir, 'data', 'outputs'))
     check_and_create_dir(os.path.join(root_dir, 'data', 'splits'))
+    check_and_create_dir(os.path.join(root_dir, 'data', 'cred'))
 
 
 def generate_general_path_base(room_id: str, timestamp: datetime.datetime, room_name: str = "") -> str:
@@ -107,12 +108,25 @@ def get_merge_conf_path(room_id: str, global_start: datetime.datetime, room_name
                             f"{generate_general_path_base(room_id, global_start, room_name)}_merge_conf.txt")
     return filename
 
+def get_cred_filename(room_id: str, root_dir: str = os.getcwd()) -> str:
+    filename = os.path.join(root_dir, 'data', 'cred',
+                            f"{room_id}_cred.json")
+    return filename
 
 def del_files_and_dir(dirs: str) -> None:
     for filename in os.listdir(dirs):
         os.remove(os.path.join(dirs, filename))
     os.rmdir(dirs)
 
+def get_rough_time(hour: int) -> str:
+    if 0 <= hour < 6:
+        return "凌晨"
+    elif 6 <= hour < 12:
+        return "上午"
+    elif 12 <= hour < 18:
+        return "下午"
+    else:
+        return "晚上"
 
 def refresh_reg() -> None:
     HWND_BROADCAST = 0xFFFF

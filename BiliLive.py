@@ -10,12 +10,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 class BiliLive(BaseLive):
     def __init__(self, config: dict):
         super().__init__(config)
-        self.room_id = config.get('spec', {}).get('room_id', '')
+        self.room_id = config['spec']['room_id']
         self.site_name = 'BiliBili'
         self.site_domain = 'live.bilibili.com'
         # 放在这里保证一次不断流的直播会一直用最初的直播间名
         self.room_name = self.get_room_info()['room_name'] if config.get(
             'root', {}).get('room_name_in_naming', False) else ""
+        self.check_live_status()
 
     def get_room_info(self) -> dict:
         data = {}
@@ -60,3 +61,15 @@ class BiliLive(BaseLive):
             logging.debug(self.generate_log("直播视频流链接：" + durl['url']))
             live_urls.append(durl['url'])
         return live_urls
+
+    def get_room_conf(self):
+        data = {}
+        url = 'https://api.live.bilibili.com/room/v1/Danmu/getConf'
+        response = self.common_request('GET', url, {
+            'room_id': self.room_id
+        }).json()
+        logging.debug(self.generate_log("房间配置消息："+response['msg']))
+        if response['msg'] == 'ok':
+            data['available_hosts'] = response['data']['host_server_list']
+            data['token'] = response['data']['token']
+        return data
